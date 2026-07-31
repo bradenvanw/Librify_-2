@@ -589,6 +589,11 @@
         let activeCopiesData = [];
         let selectedUniqueId = "";
         let pendingSelectUniqueId = null;
+        // The Status this copy had at the moment it was loaded into the form — compared
+        // against the Status being saved so we only fire a Hardcover sync on an actual
+        // transition (e.g. "Available" -> "Currently Reading"), not on every save of a
+        // book that was already Currently Reading.
+        let statusAtLoad = "Available";
         // Set when a scanned barcode fails to resolve on its own, so that if the user then
         // manually resolves it (via title search or linking to an existing library book),
         // we can remember "this barcode = this book" for future scans.
@@ -1609,12 +1614,58 @@
                 showStatus(`Successfully updated catalog: "${savedBookInstance.title}"`, "success"); 
                 appendSessionHistoryLog(savedBookInstance); 
                 fetchAllBooksFromGoogleSheet(); 
+
+                // Fire-and-forget: never let a Hardcover hiccup block the local save flow
+                // that just succeeded. Errors are logged to the console, not shown to the
+                // user, since this is a nice-to-have sync, not a core app feature.
+                maybeSyncHardcoverStatus(savedBookInstance, statusValue);
                 
                 closeBookDetailModal();
             } catch (err) { 
                 showStatus(`Spreadsheet sync error: ${err.message}`, "error"); 
                 renderIntegratedLayout(); 
             } 
+        }
+
+        // Calls the backend's syncHardcoverStatus action, but only when it's actually
+        // worth calling: the Status must have genuinely changed (not just re-saved) to
+        // one Hardcover cares about ("Currently Reading" or "Read"), and — since Librify
+        // tracks multiple physical copies per ISBN while Hardcover tracks one reading
+        // state per book — this must be the only copy of this ISBN in that state, so two
+        // copies don't fight over what Hardcover should show.
+        async function maybeSyncHardcoverStatus(savedBook, newStatus) {
+            const hardcoverStatuses = ["Currently Reading", "Read"];
+            if (newStatus === statusAtLoad) return; // no real transition, skip
+            if (!hardcoverStatuses.includes(newStatus)) return; // not a status Hardcover tracks
+
+            const otherCopiesInSameState = activeCopiesData.filter(c =>
+                c.uniqueId !== savedBook.uniqueId && hardcoverStatuses.includes(c.status)
+            );
+            if (otherCopiesInSameState.length > 0) {
+                console.log("Skipping Hardcover sync: another copy of this ISBN is already", otherCopiesInSameState[0].status);
+                return;
+            }
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "syncHardcoverStatus",
+                        token: SHARED_SECRET,
+                        isbn: savedBook.isbn,
+                        status: newStatus
+                    })
+                });
+                const resData = await response.json();
+                if (resData.status === "error") {
+                    console.warn("Hardcover sync failed:", resData.message || resData);
+                } else if (resData.status === "success") {
+                    console.log("Hardcover sync succeeded for", savedBook.title);
+                }
+            } catch (err) {
+                console.warn("Hardcover sync request failed:", err.message);
+            }
         }
 
         async function deleteBookRecord() {
@@ -3283,6 +3334,7 @@
         function loadSelectedCopyProfile(i) { 
             const c = activeCopiesData[i]; 
             selectedUniqueId = c.uniqueId; 
+            statusAtLoad = c.status || "Available";
 
             const cbl = document.getElementById("copy-buttons-list");
             if (cbl) {
@@ -3333,6 +3385,7 @@
             });
             const ni = (usedSuffixes.length > 0 ? Math.max(...usedSuffixes) : 0) + 1;
             selectedUniqueId = `${currentScannedBook.isbn}-${ni}`; 
+            statusAtLoad = "Available";
             document.getElementById("copy-badge-indicator").innerText = `Staging New: Copy ${ni}`; 
             const bl = document.getElementById("copy-buttons-list").children; 
             Array.from(bl).forEach((b, idx) => { 
