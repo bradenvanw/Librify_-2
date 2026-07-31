@@ -1964,7 +1964,12 @@
         function selectCandidateBook(item, fallbackIsbn, isAutoMatch = false) {
             const vol = item.volumeInfo || {};
             const identifiers = vol.industryIdentifiers || [];
-            const foundIsbn = identifiers.find(id => id.type === "ISBN_13" || id.type === "ISBN_10")?.identifier || fallbackIsbn || `MANUAL-${Date.now()}`;
+            // Explicitly prefer ISBN_13 over ISBN_10 when a source lists both — Google
+            // Books doesn't guarantee ordering, so a naive "first match" (the old
+            // behavior here) could silently pick the ISBN-10 depending on source order.
+            const isbn13 = identifiers.find(id => id.type === "ISBN_13")?.identifier;
+            const isbn10 = identifiers.find(id => id.type === "ISBN_10")?.identifier;
+            const foundIsbn = isbn13 || isbn10 || fallbackIsbn || `MANUAL-${Date.now()}`;
             
             const fetchedCover = vol.imageLinks && vol.imageLinks.thumbnail 
                 ? vol.imageLinks.thumbnail.replace("http://", "https://") 
