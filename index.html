@@ -1619,6 +1619,7 @@
                 // that just succeeded. Errors are logged to the console, not shown to the
                 // user, since this is a nice-to-have sync, not a core app feature.
                 maybeSyncHardcoverStatus(savedBookInstance, statusValue);
+                syncBookMetadataToHardcover(savedBookInstance);
                 
                 closeBookDetailModal();
             } catch (err) { 
@@ -1677,6 +1678,39 @@
                 }
             } catch (err) {
                 console.warn("Hardcover sync request failed:", err.message);
+            }
+        }
+
+        // Fire-and-forget, called after every successful save (regardless of status
+        // changes): syncs owned-copy count (broadcast to every configured member, since
+        // ownership reflects the shared household library) and tags (personal tags to
+        // that member's own Hardcover Lists, shared tags broadcast to everyone).
+        async function syncBookMetadataToHardcover(savedBook) {
+            // Manually-entered books (no real ISBN) can't be matched against Hardcover's
+            // catalog at all — skip rather than send a call guaranteed to fail.
+            if (!savedBook.isbn || savedBook.isbn.toString().startsWith("MANUAL-")) return;
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "syncBookMetadataToHardcover",
+                        token: SHARED_SECRET,
+                        isbn: savedBook.isbn,
+                        tags: savedBook.tags || ""
+                    })
+                });
+                const resData = await response.json();
+                if (resData.status === "error") {
+                    console.warn("Hardcover metadata sync failed:", resData.message || resData);
+                } else if (resData.status === "skipped") {
+                    console.log("Hardcover metadata sync skipped:", resData.message);
+                } else {
+                    console.log("Hardcover metadata sync complete for", savedBook.title, resData);
+                }
+            } catch (err) {
+                console.warn("Hardcover metadata sync request failed:", err.message);
             }
         }
 
