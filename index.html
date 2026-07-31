@@ -1629,20 +1629,29 @@
 
         // Calls the backend's syncHardcoverStatus action, but only when it's actually
         // worth calling: the Status must have genuinely changed (not just re-saved) to
-        // one Hardcover cares about ("Currently Reading" or "Read"), and — since Librify
-        // tracks multiple physical copies per ISBN while Hardcover tracks one reading
-        // state per book — this must be the only copy of this ISBN in that state, so two
-        // copies don't fight over what Hardcover should show.
+        // "Currently Reading" (finishing a book is handled separately, by
+        // markBookAsFinished — see below, since "Read" isn't a Status value here), and —
+        // since Librify tracks multiple physical copies per ISBN while each household
+        // member has one Hardcover reading state per book — this must be the only copy
+        // of this ISBN in that state, so two copies don't fight over what shows up.
+        //
+        // Hardcover sync is per-member: it goes to whichever member is assigned as the
+        // Reader, using their own Hardcover token — never a shared/global one.
         async function maybeSyncHardcoverStatus(savedBook, newStatus) {
-            const hardcoverStatuses = ["Currently Reading", "Read"];
+            if (newStatus !== "Currently Reading") return; // "Read" handled by markBookAsFinished
             if (newStatus === statusAtLoad) return; // no real transition, skip
-            if (!hardcoverStatuses.includes(newStatus)) return; // not a status Hardcover tracks
 
             const otherCopiesInSameState = activeCopiesData.filter(c =>
-                c.uniqueId !== savedBook.uniqueId && hardcoverStatuses.includes(c.status)
+                c.uniqueId !== savedBook.uniqueId && c.status === "Currently Reading"
             );
             if (otherCopiesInSameState.length > 0) {
-                console.log("Skipping Hardcover sync: another copy of this ISBN is already", otherCopiesInSameState[0].status);
+                console.log("Skipping Hardcover sync: another copy of this ISBN is already Currently Reading");
+                return;
+            }
+
+            const member = savedBook.reader;
+            if (!member) {
+                console.log("Skipping Hardcover sync: no reader assigned to this copy");
                 return;
             }
 
@@ -1654,17 +1663,73 @@
                         action: "syncHardcoverStatus",
                         token: SHARED_SECRET,
                         isbn: savedBook.isbn,
-                        status: newStatus
+                        status: newStatus,
+                        member: member
                     })
                 });
                 const resData = await response.json();
                 if (resData.status === "error") {
                     console.warn("Hardcover sync failed:", resData.message || resData);
+                } else if (resData.status === "skipped") {
+                    console.log("Hardcover sync skipped:", resData.message);
                 } else if (resData.status === "success") {
-                    console.log("Hardcover sync succeeded for", savedBook.title);
+                    console.log("Hardcover sync succeeded for", savedBook.title, "->", member);
                 }
             } catch (err) {
                 console.warn("Hardcover sync request failed:", err.message);
+            }
+        }
+
+        // Called from the "Mark as Finished" button next to the reader dropdown. Unlike
+        // the Status dropdown, this fires its own dedicated backend action that: tags the
+        // book "<Member>: Read", returns the physical copy to Available for the rest of
+        // the household, logs it to ReadingHistory, and syncs "Read" to that member's own
+        // Hardcover account — all server-side, in one call.
+        async function markBookAsFinished() {
+            if (!currentScannedBook || !selectedUniqueId) return;
+
+            const member = document.getElementById("input-reader").value;
+            if (!member) {
+                showStatus("Select a reader before marking this as finished.", "error");
+                return;
+            }
+
+            const confirmFinish = confirm(`Mark "${currentScannedBook.title}" as finished for ${member}? It will return to Available for the household.`);
+            if (!confirmFinish) return;
+
+            showStatus("Marking as finished...", "info");
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "markBookFinished",
+                        token: SHARED_SECRET,
+                        uniqueId: selectedUniqueId,
+                        member: member
+                    })
+                });
+                const resData = await response.json();
+
+                if (resData.status === "error") {
+                    showStatus(`Could not mark as finished: ${resData.message || "Unknown error"}`, "error");
+                    return;
+                }
+
+                const hc = resData.hardcover;
+                if (hc && hc.status === "success") {
+                    showStatus(`Marked as finished for ${member} — synced to Hardcover.`, "success");
+                } else if (hc && hc.status === "skipped") {
+                    showStatus(`Marked as finished for ${member}. (${hc.message})`, "success");
+                } else {
+                    showStatus(`Marked as finished for ${member}.`, "success");
+                }
+
+                fetchAllBooksFromGoogleSheet();
+                closeBookDetailModal();
+            } catch (err) {
+                showStatus(`Error marking as finished: ${err.message}`, "error");
             }
         }
 
@@ -3196,6 +3261,9 @@
                         <div id="reader-input-container" class="hidden space-y-1">
                             <label class="block text-[10px] font-bold text-gray-500 uppercase">Assigned Reader</label>
                             <select id="input-reader" class="w-full bg-white border-0 rounded-lg p-2 text-xs font-medium"></select>
+                            <button type="button" onclick="markBookAsFinished()" class="w-full mt-1 bg-emerald-50 hover:bg-emerald-100 active:scale-[0.98] text-emerald-700 font-semibold text-xs py-2 rounded-lg cursor-pointer transition-all flex items-center justify-center gap-1.5">
+                                <i data-lucide="check-circle" class="w-3.5 h-3.5 shrink-0"></i><span class="leading-none">Mark as Finished</span>
+                            </button>
                         </div>
 
                         <div id="borrower-input-container" class="hidden space-y-2">
