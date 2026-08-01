@@ -572,7 +572,7 @@
     </div>
 
     <script>
-        const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx8MbdeJwhcPXQjw4TGzIVqBVZH4Jq_v5irabgkw6OQlZrBn-YaRmPpzbb2YFoeDJwD/exec";
+        const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyMLokYCgCJyPz-DSW4-ql9e70l6sJ2HdZ5Ft_36yxfavgLwDRJvcFAzSd2d5tbrpQm/exec";
         // Must match the SHARED_SECRET value set in the Apps Script's Script Properties.
         // NOTE: if this repo is public, this string is public too — it only stops casual/
         // automated access, not anyone who reads the source. Make the repo private for
@@ -3105,35 +3105,50 @@
 
             button.disabled = true;
             button.classList.add("opacity-60", "cursor-not-allowed");
-            resultEl.innerHTML = `<span class="text-gray-500"><i data-lucide="loader" class="w-3 h-3 inline animate-spin"></i> Importing from Hardcover — this can take a little while for a large library...</span>`;
+
+            let offset = 0;
+            let totalWtrImported = 0, totalWtrSkipped = 0, totalReadImported = 0, totalReadSkipped = 0;
+            let page = 0;
+            const MAX_PAGES = 30; // safety cap — 30 pages x 40 books = 1200 books, far beyond any real personal library
 
             try {
-                const response = await fetch(GOOGLE_SCRIPT_URL, {
-                    method: "POST",
-                    headers: { "Content-Type": "text/plain;charset=utf-8" },
-                    body: JSON.stringify({
-                        action: "importFromHardcover",
-                        token: SHARED_SECRET,
-                        member: member,
-                        importWantToRead: importWantToRead,
-                        importRead: importRead
-                    })
-                });
-                const resData = await response.json();
+                while (page < MAX_PAGES) {
+                    page++;
+                    resultEl.innerHTML = `<span class="text-gray-500"><i data-lucide="loader" class="w-3 h-3 inline animate-spin"></i> Importing from Hardcover (batch ${page}) — imported ${totalWtrImported + totalReadImported} so far...</span>`;
 
-                if (resData.status === "error") {
-                    resultEl.innerHTML = `<span class="text-red-600">Import failed: ${resData.message || "Unknown error"}</span>`;
-                    return;
+                    const response = await fetch(GOOGLE_SCRIPT_URL, {
+                        method: "POST",
+                        headers: { "Content-Type": "text/plain;charset=utf-8" },
+                        body: JSON.stringify({
+                            action: "importFromHardcover",
+                            token: SHARED_SECRET,
+                            member: member,
+                            importWantToRead: importWantToRead,
+                            importRead: importRead,
+                            offset: offset
+                        })
+                    });
+                    const resData = await response.json();
+
+                    if (resData.status === "error") {
+                        resultEl.innerHTML = `<span class="text-red-600">Import failed on batch ${page}: ${resData.message || "Unknown error"}${(totalWtrImported + totalReadImported) > 0 ? ` — ${totalWtrImported + totalReadImported} book(s) from earlier batches were still saved.` : ''}</span>`;
+                        return;
+                    }
+
+                    totalWtrImported += resData.wantToReadImported || 0;
+                    totalWtrSkipped += resData.wantToReadSkipped || 0;
+                    totalReadImported += resData.readImported || 0;
+                    totalReadSkipped += resData.readSkipped || 0;
+
+                    if (!resData.hasMore) break;
+                    offset = resData.nextOffset || (offset + 40);
                 }
 
-                const wtrCount = resData.wantToReadImported || 0;
-                const readCount = resData.readImported || 0;
-                const wtrSkipped = resData.wantToReadSkipped || 0;
-                const readSkipped = resData.readSkipped || 0;
-                resultEl.innerHTML = `<span class="text-emerald-600">Imported ${wtrCount} want-to-read book(s) and ${readCount} read book(s) for ${member}.${(wtrSkipped + readSkipped) > 0 ? ` (${wtrSkipped + readSkipped} already present, skipped.)` : ''}</span>`;
+                const totalSkipped = totalWtrSkipped + totalReadSkipped;
+                resultEl.innerHTML = `<span class="text-emerald-600">Imported ${totalWtrImported} want-to-read book(s) and ${totalReadImported} read entr${totalReadImported === 1 ? 'y' : 'ies'} for ${member}.${totalSkipped > 0 ? ` (${totalSkipped} already present, skipped.)` : ''}</span>`;
                 await fetchAllBooksFromGoogleSheet();
             } catch (err) {
-                resultEl.innerHTML = `<span class="text-red-600">Error: ${err.message}</span>`;
+                resultEl.innerHTML = `<span class="text-red-600">Error: ${err.message}${(totalWtrImported + totalReadImported) > 0 ? ` — ${totalWtrImported + totalReadImported} book(s) from earlier batches were still saved.` : ''}</span>`;
             } finally {
                 button.disabled = false;
                 button.classList.remove("opacity-60", "cursor-not-allowed");
