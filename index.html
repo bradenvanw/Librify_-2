@@ -366,6 +366,8 @@
             <div id="home-member-content" class="space-y-6 hidden">
                 <h2 id="home-member-heading" class="text-lg font-serif font-semibold text-gray-800"></h2>
 
+                <div id="home-reading-stats-card" class="bg-white/70 rounded-2xl p-4 space-y-3"></div>
+
                 <div class="space-y-3">
                     <h3 class="text-sm font-bold text-amber-600 uppercase tracking-wider flex items-center gap-2">
                         <i data-lucide="book-open" class="w-4 h-4 shrink-0"></i><span class="leading-none">Currently Reading</span>
@@ -687,6 +689,14 @@
         // Active books borrowed from a public library — lives in its own sheet, not the
         // Books sheet, since a library loan was never part of the physical collection.
         let libraryLoansCache = [];
+        // Finished-book records — used for the home page reading stats (lifetime/yearly
+        // counts, most-read book, average time to finish). Owned-book completions live in
+        // readingHistoryCache; library-loan completions in libraryLoanHistoryCache — stats
+        // combine both, since both represent a book someone actually finished.
+        let readingHistoryCache = [];
+        let libraryLoanHistoryCache = [];
+        // Per-member annual reading goal (just a number of books), shown on the stats card.
+        let readingGoals = loadObjectSetting("librify_reading_goals", {});
 
         async function syncSettingsToServer() {
             const settingsPayload = {
@@ -778,6 +788,7 @@
                     if (Array.isArray(settings.visibleDashboardFilters)) visibleDashboardFilters = settings.visibleDashboardFilters;
                     if (Array.isArray(settings.userBorrowers)) userBorrowers = settings.userBorrowers;
                     if (settings.wantToReadOrder && typeof settings.wantToReadOrder === "object") wantToReadOrder = settings.wantToReadOrder;
+                    if (settings.readingGoals && typeof settings.readingGoals === "object") readingGoals = settings.readingGoals;
 
                     localStorage.setItem("librify_tags", JSON.stringify(userTags));
                     localStorage.setItem("librify_locations", JSON.stringify(userLocations));
@@ -785,6 +796,7 @@
                     localStorage.setItem("librify_visible_filters", JSON.stringify(visibleDashboardFilters));
                     localStorage.setItem("librify_borrowers", JSON.stringify(userBorrowers));
                     localStorage.setItem("librify_wtr_order", JSON.stringify(wantToReadOrder));
+                    localStorage.setItem("librify_reading_goals", JSON.stringify(readingGoals));
 
                     renderTagLibrarySettings();
                     renderLocationLibrarySettings();
@@ -996,10 +1008,12 @@
             
             try {
                 const cacheBuster = `&_cb=${new Date().getTime()}`;
-                const [resp, wtrResp, loansResp] = await Promise.all([
+                const [resp, wtrResp, loansResp, historyResp, loanHistoryResp] = await Promise.all([
                     fetch(`${GOOGLE_SCRIPT_URL}?action=getAll&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`),
                     fetch(`${GOOGLE_SCRIPT_URL}?action=getWantToRead&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null),
-                    fetch(`${GOOGLE_SCRIPT_URL}?action=getLibraryLoans&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null)
+                    fetch(`${GOOGLE_SCRIPT_URL}?action=getLibraryLoans&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null),
+                    fetch(`${GOOGLE_SCRIPT_URL}?action=getAllReadingHistory&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null),
+                    fetch(`${GOOGLE_SCRIPT_URL}?action=getLibraryLoanHistory&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null)
                 ]);
                 if (!resp.ok) throw new Error(`HTTP Error Status: ${resp.status}`);
 
@@ -1014,6 +1028,20 @@
                     try {
                         const loansData = await loansResp.json();
                         libraryLoansCache = loansData.data || [];
+                    } catch (e) { /* keep the previous cache on parse failure */ }
+                }
+
+                if (historyResp && historyResp.ok) {
+                    try {
+                        const historyData = await historyResp.json();
+                        readingHistoryCache = historyData.data || [];
+                    } catch (e) { /* keep the previous cache on parse failure */ }
+                }
+
+                if (loanHistoryResp && loanHistoryResp.ok) {
+                    try {
+                        const loanHistoryData = await loanHistoryResp.json();
+                        libraryLoanHistoryCache = loanHistoryData.data || [];
                     } catch (e) { /* keep the previous cache on parse failure */ }
                 }
 
@@ -1657,7 +1685,139 @@
             return [...ownedItems, ...wtrItems];
         }
 
+        // Combines owned-book finishes and library-loan finishes into one list — both
+        // represent a book someone actually finished, just with a different physical-
+        // ownership story underneath (same principle as the Currently Reading merge).
+        function allFinishedEntriesForMember(member) {
+            const owned = readingHistoryCache.filter(h => (h.member || "").toString().trim() === member);
+            const loaned = libraryLoanHistoryCache.filter(h => (h.reader || "").toString().trim() === member);
+            return [...owned, ...loaned];
+        }
+
+        function computeReadingStats(member) {
+            const isEveryone = member === EVERYONE_USER;
+            const entries = isEveryone
+                ? [...readingHistoryCache, ...libraryLoanHistoryCache]
+                : allFinishedEntriesForMember(member);
+
+            const currentYear = new Date().getFullYear();
+            const lifetimeCount = entries.length;
+            const thisYearCount = entries.filter(e => {
+                const d = e.finishedDate ? new Date(e.finishedDate) : null;
+                return d && !isNaN(d.getTime()) && d.getFullYear() === currentYear;
+            }).length;
+
+            const wantToReadCount = isEveryone
+                ? buildWantToReadItemsForEveryone().length
+                : buildWantToReadItemsForMember(member).length;
+
+            // % of the physical library read — owned books only, library loans
+            // intentionally excluded since those aren't "my library."
+            const ownedIsbns = new Set(globalCatalogCache.map(b => (b.isbn || "").toString().trim()).filter(Boolean));
+            const relevantHistory = isEveryone ? readingHistoryCache : readingHistoryCache.filter(h => (h.member || "").toString().trim() === member);
+            const readOwnedIsbns = new Set(relevantHistory.map(h => (h.isbn || "").toString().trim()).filter(isbn => ownedIsbns.has(isbn)));
+            const percentRead = ownedIsbns.size > 0 ? Math.round((readOwnedIsbns.size / ownedIsbns.size) * 100) : 0;
+
+            // Most-read book: group by title+isbn, find the highest finish count (re-reads).
+            const countByBook = {};
+            entries.forEach(e => {
+                const key = (e.title || "Unknown") + "|" + (e.isbn || "");
+                if (!countByBook[key]) countByBook[key] = { title: e.title || "Unknown", count: 0 };
+                countByBook[key].count++;
+            });
+            let mostRead = null;
+            Object.values(countByBook).forEach(b => {
+                if (b.count > 1 && (!mostRead || b.count > mostRead.count)) mostRead = b;
+            });
+
+            // Average days to finish, across entries that actually have a value — older
+            // books finished before Date Started tracking existed just won't.
+            const daysValues = entries.map(e => {
+                const n = parseInt(e.daysToFinish, 10);
+                return isNaN(n) ? null : n;
+            }).filter(n => n !== null);
+            const avgDays = daysValues.length > 0 ? Math.round(daysValues.reduce((a, b) => a + b, 0) / daysValues.length) : null;
+
+            const goal = !isEveryone ? (readingGoals[member] || null) : null;
+
+            return { lifetimeCount, thisYearCount, wantToReadCount, percentRead, mostRead, avgDays, goal };
+        }
+
+        function renderReadingStatsCard() {
+            const card = document.getElementById("home-reading-stats-card");
+            if (!card || !currentActiveUser) { if (card) card.innerHTML = ""; return; }
+
+            const isEveryone = currentActiveUser === EVERYONE_USER;
+            const stats = computeReadingStats(currentActiveUser);
+
+            const goalHTML = !isEveryone ? `
+                <div>
+                    <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Reading Goal</span>
+                    ${stats.goal ? `
+                        <span class="text-sm font-black text-indigo-600">${stats.thisYearCount} / ${stats.goal}</span>
+                        <button onclick="editReadingGoal()" class="text-gray-400 hover:text-indigo-600 cursor-pointer ml-0.5"><i data-lucide="pencil" class="w-2.5 h-2.5 inline"></i></button>
+                    ` : `
+                        <button onclick="editReadingGoal()" class="text-[11px] text-indigo-600 font-semibold cursor-pointer hover:underline">Set a goal</button>
+                    `}
+                </div>` : '';
+
+            card.innerHTML = `
+                <h3 class="text-[10px] font-bold text-gray-400 uppercase tracking-wider flex items-center gap-1.5"><i data-lucide="bar-chart-2" class="w-3 h-3 shrink-0"></i><span class="leading-none">Reading Stats</span></h3>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+                    <div>
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Read (Lifetime)</span>
+                        <span class="text-sm font-black text-gray-800">${stats.lifetimeCount}</span>
+                    </div>
+                    <div>
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Read (${new Date().getFullYear()})</span>
+                        <span class="text-sm font-black text-gray-800">${stats.thisYearCount}</span>
+                    </div>
+                    <div>
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Want to Read</span>
+                        <span class="text-sm font-black text-emerald-600">${stats.wantToReadCount}</span>
+                    </div>
+                    <div>
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Library Read</span>
+                        <span class="text-sm font-black text-gray-800">${stats.percentRead}%</span>
+                    </div>
+                    ${goalHTML}
+                    <div>
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Avg. Days to Finish</span>
+                        <span class="text-sm font-black text-gray-800">${stats.avgDays !== null ? stats.avgDays : '—'}</span>
+                    </div>
+                    <div class="col-span-2 sm:col-span-2">
+                        <span class="block text-[10px] text-gray-400 font-bold uppercase tracking-wider">Most Read</span>
+                        <span class="text-sm font-black text-gray-800 truncate block">${stats.mostRead ? `${stats.mostRead.title} (${stats.mostRead.count}\u00d7)` : 'No repeat reads yet'}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function editReadingGoal() {
+            if (!currentActiveUser || currentActiveUser === EVERYONE_USER) return;
+            const current = readingGoals[currentActiveUser] || "";
+            const input = prompt(`Set ${currentActiveUser}'s reading goal for this year (number of books):`, current);
+            if (input === null) return;
+            const goal = parseInt(input, 10);
+            if (isNaN(goal) || goal < 0) { alert("Enter a valid number."); return; }
+
+            readingGoals[currentActiveUser] = goal;
+            localStorage.setItem("librify_reading_goals", JSON.stringify(readingGoals));
+            renderReadingStatsCard();
+
+            try {
+                await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: "setReadingGoal", token: SHARED_SECRET, member: currentActiveUser, goal: goal })
+                });
+            } catch (e) {
+                console.warn("Failed to save reading goal:", e.message);
+            }
+        }
+
         function renderHomeMemberContent() {
+            renderReadingStatsCard();
             const readingContainer = document.getElementById("home-reading-list-container");
             const wantToReadContainer = document.getElementById("home-wanttoread-list-container");
             readingContainer.innerHTML = "";
