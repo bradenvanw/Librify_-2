@@ -133,6 +133,7 @@
                     <button id="settings-subtab-tags" onclick="switchSettingsSubTab('tags')" class="flex-1 text-center py-1.5 text-[11px] font-bold rounded-full cursor-pointer transition-all flex items-center justify-center gap-1"><i data-lucide="tag" class="w-3.5 h-3.5 shrink-0"></i><span class="leading-none">Tags</span></button>
                     <button id="settings-subtab-borrowers" onclick="switchSettingsSubTab('borrowers')" class="flex-1 text-center py-1.5 text-[11px] font-bold rounded-full cursor-pointer transition-all flex items-center justify-center gap-1"><i data-lucide="user-check" class="w-3.5 h-3.5 shrink-0"></i><span class="leading-none">Borrowers</span></button>
                     <button id="settings-subtab-data" onclick="switchSettingsSubTab('data')" class="flex-1 text-center py-1.5 text-[11px] font-bold rounded-full cursor-pointer transition-all flex items-center justify-center gap-1"><i data-lucide="database" class="w-3.5 h-3.5 shrink-0"></i><span class="leading-none">Data</span></button>
+                    <button id="settings-subtab-hardcover" onclick="switchSettingsSubTab('hardcover')" class="flex-1 text-center py-1.5 text-[11px] font-bold rounded-full cursor-pointer transition-all flex items-center justify-center gap-1"><i data-lucide="download-cloud" class="w-3.5 h-3.5 shrink-0"></i><span class="leading-none">Hardcover</span></button>
                 </div>
 
                 <div class="p-4 overflow-y-auto space-y-3">
@@ -188,6 +189,27 @@
                             <button onclick="addNewBorrower()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-4 py-2 rounded-lg cursor-pointer">Add</button>
                         </div>
                         <div id="borrower-library-list" class="flex flex-col gap-1.5 pt-1"></div>
+                    </div>
+
+                    <!-- Hardcover Import Panel -->
+                    <div id="settings-panel-hardcover" class="space-y-3 hidden">
+                        <p class="text-[11px] text-gray-400 italic">One-time import from a member's existing Hardcover account — useful when someone new joins the household library so they aren't starting from zero. Requires their Hardcover token to already be configured on the backend (HARDCOVER_TOKEN_&lt;NAME&gt; script property). Safe to run more than once — books already imported won't be duplicated.</p>
+                        <div>
+                            <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Import for</label>
+                            <select id="hardcover-import-member-select" class="w-full bg-gray-50 border border-gray-200 rounded-lg p-2 text-xs font-medium"></select>
+                        </div>
+                        <div class="flex flex-col gap-1.5">
+                            <label class="flex items-center gap-2 text-xs font-medium text-gray-700">
+                                <input type="checkbox" id="hardcover-import-wtr" checked class="rounded"> Want to Read list
+                            </label>
+                            <label class="flex items-center gap-2 text-xs font-medium text-gray-700">
+                                <input type="checkbox" id="hardcover-import-read" checked class="rounded"> Read history
+                            </label>
+                        </div>
+                        <button onclick="runHardcoverImport()" id="hardcover-import-button" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-2.5 rounded-xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer">
+                            <i data-lucide="download-cloud" class="w-4 h-4 shrink-0"></i><span class="leading-none">Import from Hardcover</span>
+                        </button>
+                        <div id="hardcover-import-result" class="text-xs"></div>
                     </div>
                 </div>
             </div>
@@ -2906,6 +2928,57 @@
             link.click();
             document.body.removeChild(link);
         }
+
+        // One-time, on-demand import of a member's existing Hardcover data — mainly
+        // for onboarding someone new to the household library so they don't start from
+        // zero. Deliberately manual (button press), not a background sync — see the
+        // earlier discussion about why continuous bidirectional sync is risky.
+        async function runHardcoverImport() {
+            const member = document.getElementById("hardcover-import-member-select").value;
+            const importWantToRead = document.getElementById("hardcover-import-wtr").checked;
+            const importRead = document.getElementById("hardcover-import-read").checked;
+            const resultEl = document.getElementById("hardcover-import-result");
+            const button = document.getElementById("hardcover-import-button");
+
+            if (!member) { resultEl.innerHTML = `<span class="text-red-600">Select a member first.</span>`; return; }
+            if (!importWantToRead && !importRead) { resultEl.innerHTML = `<span class="text-red-600">Select at least one thing to import.</span>`; return; }
+
+            button.disabled = true;
+            button.classList.add("opacity-60", "cursor-not-allowed");
+            resultEl.innerHTML = `<span class="text-gray-500"><i data-lucide="loader" class="w-3 h-3 inline animate-spin"></i> Importing from Hardcover — this can take a little while for a large library...</span>`;
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "importFromHardcover",
+                        token: SHARED_SECRET,
+                        member: member,
+                        importWantToRead: importWantToRead,
+                        importRead: importRead
+                    })
+                });
+                const resData = await response.json();
+
+                if (resData.status === "error") {
+                    resultEl.innerHTML = `<span class="text-red-600">Import failed: ${resData.message || "Unknown error"}</span>`;
+                    return;
+                }
+
+                const wtrCount = resData.wantToReadImported || 0;
+                const readCount = resData.readImported || 0;
+                const wtrSkipped = resData.wantToReadSkipped || 0;
+                const readSkipped = resData.readSkipped || 0;
+                resultEl.innerHTML = `<span class="text-emerald-600">Imported ${wtrCount} want-to-read book(s) and ${readCount} read book(s) for ${member}.${(wtrSkipped + readSkipped) > 0 ? ` (${wtrSkipped + readSkipped} already present, skipped.)` : ''}</span>`;
+                await fetchAllBooksFromGoogleSheet();
+            } catch (err) {
+                resultEl.innerHTML = `<span class="text-red-600">Error: ${err.message}</span>`;
+            } finally {
+                button.disabled = false;
+                button.classList.remove("opacity-60", "cursor-not-allowed");
+            }
+        }
         
         function toggleAppSettingsPanel(id) { 
             const el = document.getElementById(id); 
@@ -2915,7 +2988,7 @@
         }
 
         function switchSettingsSubTab(tab) {
-            const tabs = ['members', 'locations', 'tags', 'borrowers', 'data'];
+            const tabs = ['members', 'locations', 'tags', 'borrowers', 'data', 'hardcover'];
             const activeClass = "flex-1 text-center py-1.5 text-[11px] font-bold rounded-full bg-indigo-600 text-white cursor-pointer transition-all flex items-center justify-center gap-1";
             const inactiveClass = "flex-1 text-center py-1.5 text-[11px] font-bold rounded-full text-gray-600 hover:bg-gray-100 cursor-pointer transition-all flex items-center justify-center gap-1";
 
@@ -2938,7 +3011,14 @@
             });
             renderTagOwnerSelectOptions();
             renderActiveUserSelectOptions();
+            renderHardcoverImportMemberOptions();
             updateActiveUserButton();
+        }
+
+        function renderHardcoverImportMemberOptions() {
+            const select = document.getElementById("hardcover-import-member-select");
+            if (!select) return;
+            select.innerHTML = householdMembers.map(m => `<option value="${m}">${m}</option>`).join("");
         }
 
         // Cycles a small set of palette colors across household members so each gets a
