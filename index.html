@@ -364,6 +364,10 @@
         <!-- ================= FLOATING ADD BOOK BUTTON (SPEED DIAL) ================= -->
         <div class="fixed bottom-6 right-6 z-30 flex flex-col items-end gap-3">
             <div id="fab-options" class="hidden flex-col items-end gap-3">
+                <button onclick="startFabAction('wanttoread')" class="flex items-center gap-2.5 cursor-pointer group">
+                    <span class="text-xs font-semibold bg-white px-2.5 py-1.5 rounded-lg shadow-md text-gray-700">Want to Read</span>
+                    <span class="w-11 h-11 rounded-full bg-emerald-500 shadow-lg flex items-center justify-center group-hover:scale-105 transition-transform"><i data-lucide="bookmark" class="w-4 h-4 text-white"></i></span>
+                </button>
                 <button onclick="startFabAction('manual')" class="flex items-center gap-2.5 cursor-pointer group">
                     <span class="text-xs font-semibold bg-white px-2.5 py-1.5 rounded-lg shadow-md text-gray-700">Add Manually</span>
                     <span class="w-11 h-11 rounded-full bg-white shadow-lg flex items-center justify-center group-hover:scale-105 transition-transform"><i data-lucide="edit-3" class="w-4 h-4 text-gray-700"></i></span>
@@ -604,6 +608,12 @@
         let pendingAliasSourceIsbn = null;
         let bulkEditMode = false;
         let quickAddMode = false;
+        // "physical" (default) = the normal Add Book flow, ends in a Books-sheet row.
+        // "wantToRead" = set by the Want to Read FAB option — selecting a candidate
+        // shows a lightweight confirm screen instead of the full edit form, and never
+        // creates a Books row at all. Reset to "physical" whenever the book detail
+        // modal closes, so it can never leak into an unrelated later flow.
+        let addBookIntent = "physical";
         let quickAddDefaultLocation = "";
         let quickAddDefaultTags = [];
         let bulkSelectedUniqueIds = new Set();
@@ -624,11 +634,28 @@
             }
         }
 
+        // Same idea as loadArraySetting, but for a plain object (used for
+        // wantToReadOrder, keyed by member name).
+        function loadObjectSetting(key, fallback) {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(key));
+                return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : fallback;
+            } catch (e) {
+                return fallback;
+            }
+        }
+
         let userTags = loadArraySetting("librify_tags", ["To Read", "Favorite", "Hardcover", "Borrowed"]);
         let userLocations = loadArraySetting("librify_locations", ["Living Room Main", "Office Bookshelf", "Bedroom Table", "Unassigned / Pile"]);
         let householdMembers = loadArraySetting("librify_members", ["Self", "Partner", "Child"]);
         let visibleDashboardFilters = loadArraySetting("librify_visible_filters", [...userLocations, ...userTags]);
         let userBorrowers = loadArraySetting("librify_borrowers", []);
+        // Books not yet in the physical library that someone wants to read (separate from
+        // the "<Member>: Want to Read" tag used for books already owned).
+        let wantToReadCache = [];
+        // Per-member priority order for the merged want-to-read list (owned + not-owned).
+        // Keys are "owned:<uniqueId>" or "wtr:<isbn>" — see Code.gs for the full scheme.
+        let wantToReadOrder = loadObjectSetting("librify_wtr_order", {});
 
         async function syncSettingsToServer() {
             const settingsPayload = {
@@ -719,12 +746,14 @@
                     if (Array.isArray(settings.householdMembers)) householdMembers = settings.householdMembers;
                     if (Array.isArray(settings.visibleDashboardFilters)) visibleDashboardFilters = settings.visibleDashboardFilters;
                     if (Array.isArray(settings.userBorrowers)) userBorrowers = settings.userBorrowers;
+                    if (settings.wantToReadOrder && typeof settings.wantToReadOrder === "object") wantToReadOrder = settings.wantToReadOrder;
 
                     localStorage.setItem("librify_tags", JSON.stringify(userTags));
                     localStorage.setItem("librify_locations", JSON.stringify(userLocations));
                     localStorage.setItem("librify_members", JSON.stringify(householdMembers));
                     localStorage.setItem("librify_visible_filters", JSON.stringify(visibleDashboardFilters));
                     localStorage.setItem("librify_borrowers", JSON.stringify(userBorrowers));
+                    localStorage.setItem("librify_wtr_order", JSON.stringify(wantToReadOrder));
 
                     renderTagLibrarySettings();
                     renderLocationLibrarySettings();
@@ -936,8 +965,19 @@
             
             try {
                 const cacheBuster = `&_cb=${new Date().getTime()}`;
-                const resp = await fetch(`${GOOGLE_SCRIPT_URL}?action=getAll&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`);
+                const [resp, wtrResp] = await Promise.all([
+                    fetch(`${GOOGLE_SCRIPT_URL}?action=getAll&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`),
+                    fetch(`${GOOGLE_SCRIPT_URL}?action=getWantToRead&token=${encodeURIComponent(SHARED_SECRET)}${cacheBuster}`).catch(() => null)
+                ]);
                 if (!resp.ok) throw new Error(`HTTP Error Status: ${resp.status}`);
+
+                if (wtrResp && wtrResp.ok) {
+                    try {
+                        const wtrData = await wtrResp.json();
+                        wantToReadCache = wtrData.data || [];
+                    } catch (e) { /* keep the previous cache on parse failure */ }
+                }
+
                 const responseData = await resp.json();
                 
                 const booksList = responseData.data || responseData.books || (Array.isArray(responseData) ? responseData : null);
@@ -1500,6 +1540,88 @@
             renderHomeMemberContent();
         }
 
+        // Builds one merged want-to-read item for an owned (tagged) book.
+        function wantToReadItemFromOwnedBook_(book) {
+            return {
+                key: `owned:${book.uniqueId}`,
+                title: book.title,
+                authors: book.authors,
+                coverImage: book.coverImage || book.thumbnail || "",
+                isbn: book.isbn,
+                uniqueId: book.uniqueId,
+                source: "owned"
+            };
+        }
+
+        // Builds one merged want-to-read item for a not-owned (WantToRead sheet) entry.
+        function wantToReadItemFromWtrEntry_(entry) {
+            return {
+                key: `wtr:${entry.isbn}`,
+                title: entry.title,
+                authors: entry.authors,
+                coverImage: entry.coverImage || "",
+                isbn: entry.isbn,
+                uniqueId: null,
+                source: "wtr"
+            };
+        }
+
+        // One member's full want-to-read list — owned + not-owned merged, ordered by
+        // their saved priority (wantToReadOrder), with any not-yet-ranked items (e.g.
+        // just added) appended at the end rather than dropped.
+        function buildWantToReadItemsForMember(member) {
+            const wantTag = wantToReadTagFor(member);
+            const ownedItems = globalCatalogCache
+                .filter(b => (b.tags || "").toString().split(",").map(t => t.trim()).includes(wantTag))
+                .map(wantToReadItemFromOwnedBook_);
+            const wtrItems = wantToReadCache
+                .filter(w => (w.member || "").toString().trim() === member)
+                .map(wantToReadItemFromWtrEntry_);
+
+            const merged = [...ownedItems, ...wtrItems];
+            const order = wantToReadOrder[member] || [];
+            merged.sort((a, b) => {
+                const ai = order.indexOf(a.key);
+                const bi = order.indexOf(b.key);
+                if (ai === -1 && bi === -1) return 0;
+                if (ai === -1) return 1;
+                if (bi === -1) return -1;
+                return ai - bi;
+            });
+            return merged;
+        }
+
+        // Combined view across everyone — no single priority ranking makes sense here
+        // (whose priority would win?), so this stays in natural/fetch order, same as
+        // before, just now including not-owned entries too. Not-owned entries with
+        // multiple wanters are shown once, with all wanters listed.
+        function buildWantToReadItemsForEveryone() {
+            const allWantTags = householdMembers.map(m => wantToReadTagFor(m));
+            const ownedItems = globalCatalogCache
+                .filter(b => {
+                    const bookTags = (b.tags || "").toString().split(",").map(t => t.trim());
+                    return allWantTags.some(wt => bookTags.includes(wt));
+                })
+                .map(b => {
+                    const bookTags = (b.tags || "").toString().split(",").map(t => t.trim());
+                    const wanters = householdMembers.filter(m => bookTags.includes(wantToReadTagFor(m)));
+                    return { ...wantToReadItemFromOwnedBook_(b), wanters };
+                });
+
+            const wtrByIsbn = {};
+            wantToReadCache.forEach(w => {
+                const isbn = (w.isbn || "").toString().trim();
+                if (!isbn) return;
+                if (!wtrByIsbn[isbn]) wtrByIsbn[isbn] = { entry: w, wanters: [] };
+                wtrByIsbn[isbn].wanters.push((w.member || "").toString().trim());
+            });
+            const wtrItems = Object.values(wtrByIsbn).map(({ entry, wanters }) => ({
+                ...wantToReadItemFromWtrEntry_(entry), wanters
+            }));
+
+            return [...ownedItems, ...wtrItems];
+        }
+
         function renderHomeMemberContent() {
             const readingContainer = document.getElementById("home-reading-list-container");
             const wantToReadContainer = document.getElementById("home-wanttoread-list-container");
@@ -1507,24 +1629,19 @@
             wantToReadContainer.innerHTML = "";
 
             const isEveryone = currentActiveUser === EVERYONE_USER;
-            let readingBooks, wantToReadBooks, emptyWantMsg, emptyReadingMsg;
+            let readingBooks, wantToReadItems, emptyWantMsg, emptyReadingMsg;
 
             if (isEveryone) {
                 readingBooks = globalCatalogCache.filter(b => isReadingStatus(b.status));
-                const allWantTags = householdMembers.map(m => wantToReadTagFor(m));
-                wantToReadBooks = globalCatalogCache.filter(b => {
-                    const bookTags = (b.tags || "").toString().split(",").map(t => t.trim());
-                    return allWantTags.some(wt => bookTags.includes(wt));
-                });
+                wantToReadItems = buildWantToReadItemsForEveryone();
                 emptyReadingMsg = "No one is currently reading anything.";
                 emptyWantMsg = "No books on anyone's want-to-read list yet.";
             } else {
                 if (!currentActiveUser || !householdMembers.includes(currentActiveUser)) return;
                 readingBooks = globalCatalogCache.filter(b => isReadingStatus(b.status) && b.reader === currentActiveUser);
-                const wantTag = wantToReadTagFor(currentActiveUser);
-                wantToReadBooks = globalCatalogCache.filter(b => (b.tags || "").toString().split(",").map(t => t.trim()).includes(wantTag));
+                wantToReadItems = buildWantToReadItemsForMember(currentActiveUser);
                 emptyReadingMsg = "Not currently reading anything.";
-                emptyWantMsg = `No books on the want-to-read list yet. Add the "${wantTag}" tag to a book to add it here.`;
+                emptyWantMsg = `No books on your want-to-read list yet — use the "+" button below and choose "Want to Read".`;
             }
 
             if (readingBooks.length === 0) {
@@ -1547,27 +1664,109 @@
                 });
             }
 
-            if (wantToReadBooks.length === 0) {
+            if (wantToReadItems.length === 0) {
                 wantToReadContainer.innerHTML = `<div class="text-xs text-gray-400 italic py-2">${emptyWantMsg}</div>`;
             } else {
-                wantToReadBooks.forEach(book => {
+                wantToReadItems.forEach((wItem, idx) => {
                     const item = document.createElement("div");
-                    item.className = "flex items-center justify-between bg-emerald-50/60 p-3 rounded-xl text-xs cursor-pointer transition-colors";
-                    let subline = `<p class="text-emerald-700 font-medium">by ${book.authors || 'Unknown Author'}</p>`;
-                    if (isEveryone) {
-                        const bookTags = (book.tags || "").toString().split(",").map(t => t.trim());
-                        const wanters = householdMembers.filter(m => bookTags.includes(wantToReadTagFor(m)));
-                        subline = `<p class="text-emerald-700 font-medium">Wanted by: <b>${wanters.join(', ') || 'Unknown'}</b></p>`;
+                    item.className = "flex items-center justify-between gap-2 bg-emerald-50/60 p-3 rounded-xl text-xs transition-colors";
+
+                    let subline = `<p class="text-emerald-700 font-medium">by ${wItem.authors || 'Unknown Author'}</p>`;
+                    if (isEveryone && wItem.wanters) {
+                        subline = `<p class="text-emerald-700 font-medium">Wanted by: <b>${wItem.wanters.join(', ') || 'Unknown'}</b></p>`;
                     }
+                    const ownedBadge = wItem.source === "owned"
+                        ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-100 px-1 rounded mt-0.5">In Library</span>`
+                        : `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-gray-500 bg-gray-100 px-1 rounded mt-0.5">Not Owned</span>`;
+
+                    // Reorder + remove controls only make sense in the personal (ranked)
+                    // view — the "everyone" view has no single priority order.
+                    const reorderControlsHTML = !isEveryone ? `
+                        <div class="flex flex-col gap-0.5 shrink-0">
+                            <button onclick="moveWantToReadItem('${wItem.key}', -1)" ${idx === 0 ? 'disabled' : ''} class="w-5 h-5 flex items-center justify-center rounded bg-white text-gray-400 hover:text-emerald-600 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"><i data-lucide="chevron-up" class="w-3 h-3"></i></button>
+                            <button onclick="moveWantToReadItem('${wItem.key}', 1)" ${idx === wantToReadItems.length - 1 ? 'disabled' : ''} class="w-5 h-5 flex items-center justify-center rounded bg-white text-gray-400 hover:text-emerald-600 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"><i data-lucide="chevron-down" class="w-3 h-3"></i></button>
+                        </div>` : '';
+
+                    const actionButtonHTML = wItem.source === "owned"
+                        ? `<button onclick="manageBookByIsbn('${wItem.isbn}', '${wItem.uniqueId}')" class="text-[10px] bg-white px-2.5 py-1 rounded-full font-bold text-emerald-700 cursor-pointer hover:bg-emerald-50 transition-colors shadow-2xs whitespace-nowrap">Manage</button>`
+                        : `<button onclick="manageBookByIsbn('${wItem.isbn}')" class="text-[10px] bg-white px-2.5 py-1 rounded-full font-bold text-indigo-700 cursor-pointer hover:bg-indigo-50 transition-colors shadow-2xs whitespace-nowrap">Add to Library</button>`;
+
+                    const removeButtonHTML = !isEveryone
+                        ? `<button onclick="removeFromWantToRead('${wItem.isbn}', '${wItem.uniqueId || ''}')" title="Remove from want-to-read" class="w-5 h-5 flex items-center justify-center rounded-full text-gray-400 hover:text-red-600 hover:bg-red-50 cursor-pointer shrink-0"><i data-lucide="x" class="w-3 h-3"></i></button>`
+                        : '';
+
                     item.innerHTML = `
-                        <div>
-                            <p class="font-bold text-gray-900">${book.title}</p>
+                        ${reorderControlsHTML}
+                        <div class="flex-grow min-w-0">
+                            <p class="font-bold text-gray-900 truncate">${!isEveryone ? `#${idx + 1} ` : ''}${wItem.title}</p>
                             ${subline}
+                            ${ownedBadge}
                         </div>
-                        <button onclick="manageBookByIsbn('${book.isbn}', '${book.uniqueId}')" class="text-[10px] bg-white px-2.5 py-1 rounded-full font-bold text-emerald-700 cursor-pointer hover:bg-emerald-50 transition-colors shadow-2xs">Manage</button>
+                        <div class="flex items-center gap-1.5 shrink-0">
+                            ${actionButtonHTML}
+                            ${removeButtonHTML}
+                        </div>
                     `;
                     wantToReadContainer.appendChild(item);
                 });
+            }
+        }
+
+        // Called from the up/down buttons on a personal want-to-read entry. Swaps the
+        // item with its neighbor and sends the WHOLE new order back to the backend
+        // (simpler and less error-prone than a single-position move on the server side).
+        async function moveWantToReadItem(key, direction) {
+            const items = buildWantToReadItemsForMember(currentActiveUser);
+            const idx = items.findIndex(i => i.key === key);
+            const targetIdx = idx + direction;
+            if (idx === -1 || targetIdx < 0 || targetIdx >= items.length) return;
+
+            const reordered = items.map(i => i.key);
+            const tmp = reordered[idx];
+            reordered[idx] = reordered[targetIdx];
+            reordered[targetIdx] = tmp;
+
+            wantToReadOrder[currentActiveUser] = reordered;
+            localStorage.setItem("librify_wtr_order", JSON.stringify(wantToReadOrder));
+            renderHomeMemberContent(); // optimistic — reflect the new order immediately
+
+            try {
+                await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "reorderWantToRead",
+                        token: SHARED_SECRET,
+                        member: currentActiveUser,
+                        orderedKeys: reordered
+                    })
+                });
+            } catch (e) {
+                console.warn("Failed to save want-to-read order:", e.message);
+            }
+        }
+
+        // Called from the "x" button on a personal want-to-read entry. uniqueId present
+        // means it's an owned/tagged book (remove just the tag); otherwise it's a
+        // not-owned WantToRead sheet entry (delete the row).
+        async function removeFromWantToRead(isbn, uniqueId) {
+            if (!currentActiveUser || currentActiveUser === EVERYONE_USER) return;
+
+            try {
+                await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "removeWantToRead",
+                        token: SHARED_SECRET,
+                        isbn: isbn,
+                        uniqueId: uniqueId || "",
+                        member: currentActiveUser
+                    })
+                });
+                await fetchAllBooksFromGoogleSheet();
+            } catch (e) {
+                console.warn("Failed to remove want-to-read entry:", e.message);
             }
         }
 
@@ -2223,6 +2422,14 @@
             }
             pendingAliasSourceIsbn = null;
 
+            // Want to Read: never creates a Books row at all — show a lightweight
+            // confirm screen (pick who wants it) instead of the full edit form, and
+            // skip Quick Add entirely (that's specific to the physical-add flow).
+            if (addBookIntent === "wantToRead") {
+                showWantToReadConfirm();
+                return;
+            }
+
             // Quick Add: only for a confident single-match scan, never for a book the user
             // had to manually pick out of several candidates — that case still needs review.
             if (quickAddMode && isAutoMatch) {
@@ -2236,6 +2443,94 @@
                 showStatus("Book profile selected!", "success"); 
             }
             renderIntegratedLayout(); 
+        }
+
+        // Shown instead of the full edit form when addBookIntent === "wantToRead" — just
+        // enough to confirm which household member wants to read this, without ever
+        // creating a Books-sheet row.
+        function showWantToReadConfirm() {
+            const book = currentScannedBook;
+            const noIsbnWarning = book.isbn.startsWith("MANUAL-")
+                ? `<p class="text-[10px] text-amber-600 mt-1">No ISBN found for this edition — it can still be added, but Hardcover sync won't work for it.</p>`
+                : '';
+
+            const defaultMember = (currentActiveUser && currentActiveUser !== EVERYONE_USER && householdMembers.includes(currentActiveUser))
+                ? currentActiveUser : (householdMembers[0] || "");
+            const memberOptionsHTML = householdMembers.map(m =>
+                `<option value="${m}" ${m === defaultMember ? 'selected' : ''}>${m}</option>`
+            ).join("");
+
+            openBookDetailModal();
+            bookResult.innerHTML = `
+                <div class="bg-white rounded-2xl shadow-sm p-4 sm:p-6 space-y-4">
+                    <div class="flex gap-4 items-start">
+                        <div class="w-16 h-24 shrink-0 bg-gradient-to-b from-gray-100 to-gray-200 rounded-xl overflow-hidden shadow-md ring-1 ring-black/5">
+                            <img src="${book.coverImage || FALLBACK_COVER}" class="w-full h-full object-cover" onerror="this.src='${FALLBACK_COVER}'">
+                        </div>
+                        <div class="min-w-0">
+                            <p class="font-serif font-semibold text-gray-900 text-sm">${book.title}</p>
+                            <p class="text-xs text-gray-500">by ${book.authors}</p>
+                            ${noIsbnWarning}
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Who wants to read this?</label>
+                        <select id="wtr-member-select" class="w-full bg-gray-50 border border-gray-200 rounded-xl p-2.5 text-xs">
+                            ${memberOptionsHTML}
+                        </select>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="confirmAddToWantToRead()" class="flex-grow bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 rounded-xl text-xs transition-colors cursor-pointer">Add to Want to Read</button>
+                        <button onclick="closeBookDetailModal()" class="bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold px-4 py-2.5 rounded-xl text-xs transition-colors cursor-pointer">Cancel</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Fires the actual addWantToRead backend call using whatever selectCandidateBook
+        // already populated onto currentScannedBook.
+        async function confirmAddToWantToRead() {
+            const memberSelect = document.getElementById("wtr-member-select");
+            const member = memberSelect ? memberSelect.value : "";
+            if (!member) { showStatus("Select a member first.", "error"); return; }
+
+            const book = currentScannedBook;
+            showStatus("Adding to want-to-read...", "info");
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "addWantToRead",
+                        token: SHARED_SECRET,
+                        isbn: book.isbn,
+                        title: book.title,
+                        authors: book.authors,
+                        coverImage: book.coverImage || book.thumbnail || "",
+                        publisher: book.publisher,
+                        publishedDate: book.publishedDate,
+                        pageCount: book.pageCount,
+                        description: book.description,
+                        categories: book.categories,
+                        seriesName: book.seriesName,
+                        seriesNumber: book.seriesNumber,
+                        member: member
+                    })
+                });
+                const resData = await response.json();
+
+                if (resData.status === "error") {
+                    showStatus(`Could not add to want-to-read: ${resData.message || "Unknown error"}`, "error");
+                    return;
+                }
+
+                showStatus(`Added "${book.title}" to ${member}'s want-to-read list.`, "success");
+                closeBookDetailModal();
+                await fetchAllBooksFromGoogleSheet();
+            } catch (err) {
+                showStatus(`Error: ${err.message}`, "error");
+            }
         }
         
         isbnInput.addEventListener("keyup", function(e) { if (e.key === "Enter") { const q = isbnInput.value.trim(); if (q) checkExistingAndFetchMetadata(q); } });
@@ -2989,6 +3284,7 @@
             pendingSelectUniqueId = null;
             pendingAliasSourceIsbn = null;
             isbnInput.value = "";
+            addBookIntent = "physical";
         }
 
         function openAddBookModal() {
@@ -3047,12 +3343,25 @@
             closeFabMenu();
 
             if (action === "manual") {
+                addBookIntent = "physical";
                 openManualBookModal();
                 return;
             }
 
+            addBookIntent = (action === "wanttoread") ? "wantToRead" : "physical";
+
             openAddBookModal();
-            setAddBookModalMode(action);
+            setAddBookModalMode(action === "wanttoread" ? "lookup" : action);
+
+            if (action === "wanttoread") {
+                quickAddMode = false;
+                isbnInput.placeholder = "Search for a book to add to a want-to-read list...";
+                isbnInput.focus();
+                const titleEl = document.getElementById("add-book-modal-title");
+                const titleSpan = titleEl.querySelector("span");
+                if (titleSpan) titleSpan.innerText = "Add to Want to Read";
+                return;
+            }
 
             if (action === "lookup") {
                 quickAddMode = false;
