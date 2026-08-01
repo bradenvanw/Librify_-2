@@ -2133,7 +2133,11 @@
                 return;
             }
             
-            showStatus("Book profile selected!", "success"); 
+            if (foundIsbn.startsWith("MANUAL-")) {
+                showStatus("Book selected, but no real ISBN could be found for this edition — Hardcover sync and some enrichment won't work for it. You can still save it, or try a different candidate/edition.", "info");
+            } else {
+                showStatus("Book profile selected!", "success"); 
+            }
             renderIntegratedLayout(); 
         }
         
