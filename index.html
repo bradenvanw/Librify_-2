@@ -2222,7 +2222,10 @@
                         const title = vol.title || "Unknown Title";
                         const authors = vol.authors ? vol.authors.join(", ") : "Unknown Author";
                         const year = vol.publishedDate ? (vol.publishedDate.match(/\d{4}/) || ["N/A"])[0] : "N/A";
-                        const sourceBadge = item._source === "openlibrary" ? `<span class="inline-block mt-0.5 text-[8px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 px-1 rounded">via Open Library</span>` : '';
+                        const sourceBadge = item._source === "openlibrary"
+                            ? `<span class="inline-block mt-0.5 text-[8px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 px-1 rounded">via Open Library</span>`
+                            : (item._source === "hardcover" ? `<span class="inline-block mt-0.5 text-[8px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-50 border border-emerald-200 px-1 rounded">via Hardcover</span>`
+                            : (item._source === "googlebooks" ? `<span class="inline-block mt-0.5 text-[8px] font-bold uppercase tracking-wide text-blue-700 bg-blue-50 border border-blue-200 px-1 rounded">via Google Books</span>` : ''));
         
                         const card = document.createElement("div");
                         card.className = "bg-white p-3 rounded-xl border border-gray-200 shadow-2xs flex gap-3 items-center text-left hover:border-indigo-400 cursor-pointer transition-all";
@@ -3664,7 +3667,7 @@
                         </button>` : ''}
                     </div>
                     <div class="space-y-2 flex-grow min-w-0 text-left">
-                        ${currentScannedBook.dataSource === "openlibrary" ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full">via Open Library</span>` : ''}
+                        ${currentScannedBook.dataSource === "openlibrary" ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full">via Open Library</span>` : (currentScannedBook.dataSource === "hardcover" ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-full">via Hardcover</span>` : (currentScannedBook.dataSource === "googlebooks" ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded-full">via Google Books</span>` : ''))}
                         <div>
                             <label class="block text-[9px] font-bold text-gray-400 uppercase tracking-wider">Title${missingBadge(currentScannedBook.title)}</label>
                             <input type="text" id="input-title" class="w-full text-base sm:text-xl font-serif font-semibold text-gray-900 bg-transparent border-b-2 ${isMissingValue(currentScannedBook.title) ? 'border-amber-300' : 'border-transparent'} focus:border-indigo-400 focus:outline-none py-0.5">
