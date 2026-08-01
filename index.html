@@ -253,6 +253,9 @@
                         <button onclick="openBulkTagsModal('remove')" class="bg-white hover:bg-gray-50 text-gray-700 font-semibold px-3 py-1.5 rounded-lg text-[11px] transition-colors flex items-center gap-1 cursor-pointer">
                             <i data-lucide="tag" class="w-3 h-3"></i> Remove Tags
                         </button>
+                        <button onclick="bulkRefreshFromHardcover()" class="bg-white hover:bg-gray-50 text-gray-700 font-semibold px-3 py-1.5 rounded-lg text-[11px] transition-colors flex items-center gap-1 cursor-pointer">
+                            <i data-lucide="refresh-cw" class="w-3 h-3"></i> Refresh from Hardcover
+                        </button>
                         <button onclick="toggleBulkEditMode()" class="text-gray-500 hover:text-gray-700 font-semibold px-2 py-1.5 rounded-lg text-[11px] transition-colors cursor-pointer">
                             Cancel
                         </button>
@@ -1291,6 +1294,52 @@
             }
         }
 
+        // Refreshes cover/pages/description/genre/series from Hardcover for every
+        // selected book, capped server-side at 40 per call (see refreshBooksFromHardcover
+        // in Code.gs) to stay within Apps Script's execution window and Hardcover's rate
+        // limit. Never touches status, reader, tags, notes, or location.
+        async function bulkRefreshFromHardcover() {
+            if (bulkSelectedUniqueIds.size === 0) { alert("Select at least one book first."); return; }
+
+            const count = bulkSelectedUniqueIds.size;
+            if (count > 40) {
+                alert(`You've selected ${count} books — refresh 40 or fewer at a time to avoid the request timing out partway through.`);
+                return;
+            }
+
+            searchStatusMessage.innerHTML = `<i data-lucide="loader" class="w-3 h-3 inline shrink-0 animate-spin"></i> Refreshing ${count} book(s) from Hardcover — this may take a moment...`;
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "refreshBooksFromHardcover",
+                        token: SHARED_SECRET,
+                        uniqueIds: Array.from(bulkSelectedUniqueIds)
+                    })
+                });
+                const resData = await response.json();
+
+                if (resData.status === "error") {
+                    alert(`Refresh failed: ${resData.message || "Unknown error"}`);
+                    return;
+                }
+
+                const results = resData.results || {};
+                const isbns = Object.keys(results);
+                const succeeded = isbns.filter(isbn => results[isbn].status === "success").length;
+                const skipped = isbns.filter(isbn => results[isbn].status === "skipped").length;
+
+                toggleBulkEditMode();
+                await fetchAllBooksFromGoogleSheet();
+                searchStatusMessage.innerHTML = `<i data-lucide="check-circle" class="w-3 h-3 inline shrink-0"></i> Refreshed ${succeeded} book(s) from Hardcover${skipped > 0 ? ` (${skipped} had no Hardcover match)` : ''}.`;
+            } catch (e) {
+                console.error("Error running bulk Hardcover refresh:", e);
+                alert("Bulk refresh failed. Please try again.");
+            }
+        }
+
         function renderCheckoutTab() {
             const checkedOutContainer = document.getElementById("checkedout-list-container");
             const borrowerSummaryCard = document.getElementById("checkout-borrower-summary-card");
@@ -1732,6 +1781,54 @@
                 }
             } catch (err) {
                 console.warn("Hardcover metadata sync request failed:", err.message);
+            }
+        }
+
+        // Called from the "Refresh" button under the cover image on an already-saved
+        // book. Explicitly re-fetches and applies Hardcover's catalog fields (cover,
+        // pages, description, genre, series) — deliberately does NOT touch status,
+        // reader, tags, notes, or location, so this is safe to run any time without
+        // risking your personal edits.
+        async function refreshCurrentBookFromHardcover() {
+            if (!selectedUniqueId) return;
+            showStatus("Refreshing from Hardcover...", "info");
+
+            try {
+                const response = await fetch(GOOGLE_SCRIPT_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({
+                        action: "refreshFromHardcover",
+                        token: SHARED_SECRET,
+                        uniqueId: selectedUniqueId
+                    })
+                });
+                const resData = await response.json();
+
+                if (resData.status === "error") {
+                    showStatus(`Refresh failed: ${resData.message || "Unknown error"}`, "error");
+                    return;
+                }
+                if (resData.status === "skipped") {
+                    showStatus(`Nothing to refresh — ${resData.message}`, "info");
+                    return;
+                }
+
+                // Pull the freshly-updated row back from the sheet and reload it into the
+                // form, reusing the same pendingSelectUniqueId + renderIntegratedLayout
+                // pattern the rest of the app already uses to select the right copy.
+                const isbn = currentScannedBook.isbn;
+                const lookupResponse = await fetch(`${GOOGLE_SCRIPT_URL}?isbn=${encodeURIComponent(isbn)}&token=${encodeURIComponent(SHARED_SECRET)}`);
+                const lookupData = await lookupResponse.json();
+                activeCopiesData = lookupData.copies || [];
+                pendingSelectUniqueId = selectedUniqueId;
+                renderIntegratedLayout();
+
+                const updatedList = (resData.updatedFields && resData.updatedFields.length > 0) ? resData.updatedFields.join(", ") : "nothing new";
+                showStatus(`Refreshed from Hardcover (${updatedList}).`, "success");
+                fetchAllBooksFromGoogleSheet();
+            } catch (err) {
+                showStatus(`Refresh error: ${err.message}`, "error");
             }
         }
 
@@ -3248,8 +3345,14 @@
             bookResult.innerHTML = `
                 ${overdueBannerHTML}
                 <div class="bg-white rounded-2xl shadow-sm p-4 sm:p-6 flex flex-row gap-4 sm:gap-6 items-start">
-                    <div class="w-24 h-36 sm:w-32 sm:h-44 shrink-0 bg-gradient-to-b from-gray-100 to-gray-200 rounded-xl overflow-hidden shadow-md ring-1 ring-black/5">
-                        <img id="book-cover-img" src="${coverUrl}" class="w-full h-full object-cover" onerror="this.src='${FALLBACK_COVER}'">
+                    <div class="w-24 h-36 sm:w-32 sm:h-44 shrink-0 space-y-1.5">
+                        <div class="bg-gradient-to-b from-gray-100 to-gray-200 rounded-xl overflow-hidden shadow-md ring-1 ring-black/5 w-full h-36 sm:h-44">
+                            <img id="book-cover-img" src="${coverUrl}" class="w-full h-full object-cover" onerror="this.src='${FALLBACK_COVER}'">
+                        </div>
+                        ${activeCopiesData.some(c => c.uniqueId === selectedUniqueId) ? `
+                        <button type="button" onclick="refreshCurrentBookFromHardcover()" title="Re-fetch cover, pages, description, genre, and series from Hardcover" class="w-full bg-white hover:bg-gray-50 border border-gray-200 text-gray-500 hover:text-indigo-600 text-[9px] font-semibold py-1 rounded-lg cursor-pointer transition-colors flex items-center justify-center gap-1">
+                            <i data-lucide="refresh-cw" class="w-2.5 h-2.5 shrink-0"></i><span class="leading-none">Refresh</span>
+                        </button>` : ''}
                     </div>
                     <div class="space-y-2 flex-grow min-w-0 text-left">
                         ${currentScannedBook.dataSource === "openlibrary" ? `<span class="inline-block text-[8px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full">via Open Library</span>` : ''}
